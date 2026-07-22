@@ -188,8 +188,6 @@ class EntryStore:
                     mode="replace", upload_id=upload.upload_id, format="parquet"
                 ),
             )
-            for declaration in indexes or ():
-                self._create_index(created.default_connection_id, declaration)
             inline_payload = encode_inline_payload(
                 table, self._config.inline_threshold_bytes
             )
@@ -203,7 +201,7 @@ class EntryStore:
                     x_database_id=database_id,
                     auto_follow=False,
                 ).result_id
-            return self._registry.mark_ready(
+            entry = self._registry.mark_ready(
                 fingerprint,
                 database_id=database_id,
                 ttl=ttl,
@@ -220,6 +218,20 @@ class EntryStore:
             # database without a ready row must not outlive the attempt.
             self._cleanup_failed_build(fingerprint, database_id)
             raise StoreError(f"materializing entry failed: {exc}") from exc
+
+        # Index kickoff is deliberately OUTSIDE the publication failure
+        # domain: a bad provider id or a stuck table lock must not discard
+        # otherwise-valid cached data. The entry stays served; search errors
+        # at the search site until the index problem is fixed.
+        try:
+            for declaration in indexes or ():
+                self._create_index(created.default_connection_id, declaration)
+        except Exception as exc:
+            raise StoreError(
+                f"index creation for entry {fp.short(fingerprint)} failed "
+                f"(entry cached; search unavailable): {exc}"
+            ) from exc
+        return entry
 
     def read_table(self, entry: RegistryEntry) -> pa.Table:
         """Materialize an entry's data as a pyarrow.Table.

@@ -226,3 +226,24 @@ def test_embedded_vector_cannot_combine_with_other_indexes():
 
     with pytest.raises(ValueError, match="cannot be combined"):
         materialize(index=[BM25("notes"), Vector("notes", provider="emb_1")])
+
+
+def test_index_failure_does_not_discard_the_cached_entry(runtime, monkeypatch):
+    from hotdata_materialized import BM25
+    from hotdata_materialized.registry import STATUS_READY
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("bad embedding provider")
+
+    monkeypatch.setattr(runtime.backend.indexes, "create_index", broken)
+
+    @materialize(ttl=60, index=BM25("notes"))
+    def notes():
+        return [{"notes": "outage", "n": 1}]
+
+    notes()
+    errors = runtime.store.flush()
+    assert len(errors) == 1 and "entry cached" in str(errors[0])
+    frame = notes()  # next call is a hit despite the failed index
+    assert frame.cached is True
+    assert frame.entry.status == STATUS_READY
