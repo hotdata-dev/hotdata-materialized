@@ -1,0 +1,178 @@
+"""The @materialize decorator and the MaterializedFrame handle.
+
+Wrap an expensive function with @materialize: a hit returns a frame backed by
+Hotdata without calling the function; a miss calls it, returns a frame over
+the computed result immediately, and persists write-behind. The wrapped
+function must return something table-shaped: a pyarrow.Table, a pandas
+DataFrame, or an iterable of dicts (e.g. a Django .values() queryset).
+
+Fail-open: if the hit check or the persist raises a MaterializedError, the
+function runs and its result is served uncached — the cache can degrade to
+"no cache," never to "no page."
+"""
+
+from __future__ import annotations
+
+import functools
+import logging
+import re
+import threading
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import pyarrow as pa
+
+from .client import get_clients
+from .conf import Config
+from .exceptions import MaterializedError
+from .fingerprint import fingerprint_call
+from .registry import STATUS_READY, Registry, RegistryEntry
+from .store import DATA_TABLE, EntryStore
+
+logger = logging.getLogger(__name__)
+
+_THIS = re.compile(r"\bthis\b")
+
+
+class MaterializedFrame:
+    """Handle over a materialized entry. One interface, two backings: a fresh
+    miss wraps the locally computed table; a hit reads from Hotdata lazily."""
+
+    def __init__(
+        self,
+        store: EntryStore,
+        entry: RegistryEntry,
+        table: Optional[pa.Table] = None,
+        *,
+        cached: bool,
+    ):
+        self._store = store
+        self.entry = entry
+        self._table = table
+        self.cached = cached
+
+    def arrow(self) -> pa.Table:
+        if self._table is None:
+            self._table = self._store.read_table(self.entry)
+        return self._table
+
+    def to_pylist(self) -> List[Dict[str, Any]]:
+        return self.arrow().to_pylist()
+
+    def df(self) -> Any:
+        """The data as a pandas.DataFrame (requires pandas)."""
+        return self.arrow().to_pandas()
+
+    def sql(self, sql: str) -> pa.Table:
+        """Run SQL server-side against this entry's database; the identifier
+        `this` names the cached data (e.g. "SELECT x FROM this LIMIT 5")."""
+        return self._store.query_table(self.entry, _THIS.sub(DATA_TABLE, sql))
+
+    def __len__(self) -> int:
+        return self.arrow().num_rows
+
+
+_runtime_lock = threading.Lock()
+_runtime: Optional[Tuple[Registry, EntryStore]] = None
+
+
+def get_runtime() -> Tuple[Registry, EntryStore]:
+    """The process-wide (Registry, EntryStore) pair, built from Django
+    settings on first use."""
+    global _runtime
+    with _runtime_lock:
+        if _runtime is None:
+            config = Config.from_django()
+            clients = get_clients(config)
+            registry = Registry(clients, config)
+            _runtime = (registry, EntryStore(clients, config, registry))
+        return _runtime
+
+
+def reset_runtime() -> None:
+    global _runtime
+    with _runtime_lock:
+        _runtime = None
+
+
+def to_arrow(result: Any) -> pa.Table:
+    """Normalize a captured result into a pyarrow.Table."""
+    if isinstance(result, pa.Table):
+        return result
+    if type(result).__module__.split(".")[0] == "pandas":
+        return pa.Table.from_pandas(result)
+    rows = list(result)
+    if rows and not isinstance(rows[0], dict):
+        raise TypeError(
+            "materialize expects a pyarrow.Table, a pandas.DataFrame, or an "
+            "iterable of dicts (e.g. a .values() queryset); got an iterable "
+            f"of {type(rows[0]).__name__}"
+        )
+    return pa.Table.from_pylist(rows)
+
+
+def materialize(
+    key: Optional[str] = None,
+    *,
+    ttl: Optional[int] = 3600,
+    version: int = 0,
+    background: Optional[bool] = None,
+    key_fn: Optional[Callable[..., Any]] = None,
+) -> Callable[[Callable[..., Any]], Callable[..., MaterializedFrame]]:
+    """Materialize a function's result into Hotdata.
+
+        @materialize(ttl=3600)
+        def revenue_by_region():
+            return Order.objects.values("region").annotate(revenue=Sum("total"))
+
+    The call returns a MaterializedFrame either way; `.cached` says which path
+    served it. `version=` busts the cache on code changes; `key_fn=` maps
+    non-JSON-serializable arguments to a stable identity.
+    """
+
+    def decorate(func: Callable[..., Any]) -> Callable[..., MaterializedFrame]:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> MaterializedFrame:
+            registry, store = get_runtime()
+            fingerprint = fingerprint_call(
+                func, args, kwargs, version=version, key_fn=key_fn
+            )
+            entry = None
+            try:
+                entry = registry.lookup(fingerprint)
+            except MaterializedError:
+                logger.warning(
+                    "hit check for %s failed; running uncached",
+                    func.__qualname__,
+                    exc_info=True,
+                )
+            if (
+                entry is not None
+                and entry.status == STATUS_READY
+                and not entry.is_expired(store._now())
+            ):
+                return MaterializedFrame(store, entry, cached=True)
+
+            result = func(*args, **kwargs)
+            table = to_arrow(result)
+            label = key or func.__qualname__
+            try:
+                pending = store.materialize(
+                    fingerprint,
+                    table,
+                    key=label,
+                    ttl=ttl,
+                    version=version,
+                    background=background,
+                )
+            except MaterializedError:
+                logger.warning(
+                    "persist of %s failed; serving the result uncached",
+                    label,
+                    exc_info=True,
+                )
+                pending = RegistryEntry(fingerprint=fingerprint, key=label)
+            return MaterializedFrame(store, pending, table=table, cached=False)
+
+        return wrapper
+
+    return decorate

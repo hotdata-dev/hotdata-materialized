@@ -231,24 +231,40 @@ class EntryStore:
                     fp.short(entry.fingerprint),
                 )
         try:
-            response = self._clients.query.query(
-                QueryRequest(sql=f"SELECT * FROM {DATA_TABLE}"),
-                x_database_id=database_id,
-                auto_follow=False,
-            )
-            if response.result_id is None:
-                # answered fully inline and never persisted; nothing to fetch.
-                # Keep the column names even for zero rows.
-                if not response.rows:
-                    return pa.table({column: [] for column in response.columns})
-                return pa.Table.from_pylist(
-                    [dict(zip(response.columns, row)) for row in response.rows]
-                )
-            return self._fetch_arrow(response.result_id, database_id)
+            return self._run_select(database_id, f"SELECT * FROM {DATA_TABLE}")
         except Exception as exc:
             raise StoreError(
                 f"reading entry {fp.short(entry.fingerprint)} failed: {exc}"
             ) from exc
+
+    def query_table(self, entry: RegistryEntry, sql: str) -> pa.Table:
+        """Run SQL server-side against the entry's database, returning Arrow."""
+        database_id = entry.database_id
+        if database_id is None:
+            raise StoreError(
+                f"entry {fp.short(entry.fingerprint)} has no database yet "
+                "(still building?)"
+            )
+        try:
+            return self._run_select(database_id, sql)
+        except Exception as exc:
+            raise StoreError(
+                f"query on entry {fp.short(entry.fingerprint)} failed: {exc}"
+            ) from exc
+
+    def _run_select(self, database_id: str, sql: str) -> pa.Table:
+        response = self._clients.query.query(
+            QueryRequest(sql=sql), x_database_id=database_id, auto_follow=False
+        )
+        if response.result_id is None:
+            # answered fully inline and never persisted; nothing to fetch.
+            # Keep the column names even for zero rows.
+            if not response.rows:
+                return pa.table({column: [] for column in response.columns})
+            return pa.Table.from_pylist(
+                [dict(zip(response.columns, row)) for row in response.rows]
+            )
+        return self._fetch_arrow(response.result_id, database_id)
 
     def _fetch_arrow(self, result_id: str, database_id: str) -> pa.Table:
         """Fetch a persisted result as Arrow, waiting out async persistence

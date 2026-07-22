@@ -1,11 +1,12 @@
 """hotdata-materialized: offload expensive Django query results to Hotdata.
 
-Step-1 surface: fingerprinting, the remote registry, and the entry store.
-The @materialize decorator and MaterializedFrame build on these (step 2).
+Public surface: the @materialize decorator and MaterializedFrame handle,
+built on fingerprinting, the remote registry, and the entry store.
 """
 
 from .conf import Config
 from .client import HotdataClients, get_clients, reset_clients
+from .decorator import MaterializedFrame, materialize
 from .exceptions import (
     ConfigurationError,
     FingerprintError,
@@ -20,6 +21,8 @@ from .store import EntryStore
 __version__ = "0.1.0"
 
 __all__ = [
+    "materialize",
+    "MaterializedFrame",
     "Config",
     "HotdataClients",
     "get_clients",
