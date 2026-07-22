@@ -181,7 +181,7 @@ trade-offs.
 - [x] Vector/BM25 index declarations, `frame.search()` and
       `frame.vector_search()`
 - [ ] Async view support (`await frame.aarrow()`)
-- [ ] PyPI release
+- [x] PyPI release (0.1.0)
 
 ## Demo
 
