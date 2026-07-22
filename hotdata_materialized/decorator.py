@@ -31,6 +31,16 @@ from .store import DATA_TABLE, EntryStore
 logger = logging.getLogger(__name__)
 
 _THIS = re.compile(r"\bthis\b")
+# quoted chunks ('...' with '' escapes, "..." with "" escapes) pass through
+# untouched so a literal like WHERE label = 'this' is never rewritten
+_SQL_CHUNKS = re.compile(r"('(?:[^']|'')*'|\"(?:[^\"]|\"\")*\")")
+
+
+def _rewrite_this(sql: str) -> str:
+    return "".join(
+        part if part.startswith(("'", '"')) else _THIS.sub(DATA_TABLE, part)
+        for part in _SQL_CHUNKS.split(sql)
+    )
 
 
 class MaterializedFrame:
@@ -64,8 +74,12 @@ class MaterializedFrame:
 
     def sql(self, sql: str) -> pa.Table:
         """Run SQL server-side against this entry's database; the identifier
-        `this` names the cached data (e.g. "SELECT x FROM this LIMIT 5")."""
-        return self._store.query_table(self.entry, _THIS.sub(DATA_TABLE, sql))
+        `this` names the cached data (e.g. "SELECT x FROM this LIMIT 5").
+
+        Requires a persisted entry: available on hits, or after the
+        write-behind persist lands (a fresh miss raises StoreError until
+        then; use background=False on the decorator to persist inline)."""
+        return self._store.query_table(self.entry, _rewrite_this(sql))
 
     def __len__(self) -> int:
         return self.arrow().num_rows

@@ -209,6 +209,11 @@ write-through for callers that need `.sql()` on the entry immediately.
 
 ## MaterializedFrame
 
+First cut implements `.arrow()`, `.df()`, `.to_pylist()`, `len()`, and
+`.sql()` (server-side; requires a persisted entry — on a fresh
+write-behind miss it raises until the background persist lands). The
+rest of this section is the target design.
+
 One interface, three backings (inline-payload, remote, local-after-miss);
 calling code never branches.
 
@@ -237,18 +242,17 @@ frame.meta                       # fingerprint, database_id, created_at, expires
 
 ## Decorator API
 
+Implemented (first cut):
+
 ```python
-from hotdata_materialized import materialize, Vector
+from hotdata_materialized import materialize
 
 @materialize(
     key="daily-signups",          # label; fingerprint still includes args
-    ttl=3600,                     # seconds; None = manual invalidation only
+    ttl=3600,                     # seconds; None = never expires
     version=2,                    # bump to bust on code changes
-    mode="swr",                   # "swr" (default) | "strict"
     background=True,              # write-behind (default) | write-through
-    index=Vector(column="notes", provider="openai", metric="cosine"),
-    invalidate_on=[Event],        # opt-in signal-based staleness marking
-    on_error="fallback",          # "fallback" (default) | "raise"
+    key_fn=None,                  # stable identity for opaque arguments
 )
 def daily_signups(start, end):
     return (Event.objects
@@ -257,12 +261,11 @@ def daily_signups(start, end):
             .annotate(n=Count("id")))
 ```
 
-Also usable imperatively for one-off QuerySets:
-
-```python
-from hotdata_materialized import from_queryset
-frame = from_queryset(qs, ttl=900)
-```
+Planned knobs (steps 4–5, do not document user-facing until they exist):
+`mode="swr" | "strict"` (refresh behavior), `invalidate_on=[Model]`
+(signal-based staleness), `index=Vector(...)/BM25(...)` (search indexes),
+`on_error="fallback" | "raise"` (fail-open is currently always on), and a
+`from_queryset(qs, ttl=)` imperative helper for one-off QuerySets.
 
 ## Fingerprinting
 
@@ -350,6 +353,7 @@ synchronous — fine for WSGI; async views get `sync_to_async` wrappers
    load → registry upsert; delete path). Pure SDK composition.
 2. **`@materialize` + `MaterializedFrame`** with the three backings,
    `.df()/.arrow()/.pl()/.sql()`, inline-payload short-circuit, fail-open.
+   *(shipped: first cut — arrow/df/to_pylist/sql, fail-open)*
 3. **Chainable facade:** immutable lazy queryset compiler over the entry
    table (Django lookup syntax).
 4. **Freshness machinery:** SWR, building-row lock, sweep management command +
