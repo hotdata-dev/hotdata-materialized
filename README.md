@@ -129,13 +129,22 @@ persist leaves no registry row, and the next request simply misses again.
 See [DESIGN.md](DESIGN.md) for the architecture and the accepted
 trade-offs.
 
-## Status / roadmap
+## Roadmap
 
-First draft. Implemented: the `@materialize` decorator and
-`MaterializedFrame` (first cut), fingerprinting, the remote registry, entry
-store with write-behind persists, Arrow-native reads, and the TPC-H demo.
-Next: stale-while-revalidate refresh, the sweep command, a chainable queryset
-facade on the frame, and vector/BM25 index declarations.
+- [x] Content-addressed fingerprinting (querysets and function calls)
+- [x] Remote registry — no migrations or local state in the host app
+- [x] Entry store with write-behind persists
+- [x] Arrow-native reads (inline payloads, persisted-result fetch)
+- [x] `@materialize` decorator and `MaterializedFrame`
+      (`.arrow()/.df()/.to_pylist()/.sql()`)
+- [x] TPC-H demo and benchmark
+- [x] CI: pytest, mypy, flake8
+- [ ] Stale-while-revalidate refresh (rebuild protocol)
+- [ ] Sweep command for expired entries
+- [ ] Chainable queryset facade on the frame (`.filter()/.order_by()`)
+- [ ] Vector/BM25 index declarations and `frame.search()`
+- [ ] Async view support (`await frame.aarrow()`)
+- [ ] PyPI release
 
 ## Demo
 
