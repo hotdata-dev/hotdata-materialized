@@ -17,16 +17,18 @@ import functools
 import logging
 import re
 import threading
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import pyarrow as pa
 
 from .client import get_clients
 from .conf import Config
 from .exceptions import MaterializedError
+from ._sql import quote_ident, quote_literal
 from .fingerprint import fingerprint_call
+from .indexes import BM25, Vector
 from .registry import STATUS_READY, Registry, RegistryEntry
-from .store import DATA_TABLE, EntryStore
+from .store import DATA_SCHEMA, DATA_TABLE, EntryStore
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +83,29 @@ class MaterializedFrame:
         then; use background=False on the decorator to persist inline)."""
         return self._store.query_table(self.entry, _rewrite_this(sql))
 
+    def search(self, query: str, *, column: str, limit: int = 10) -> pa.Table:
+        """BM25 keyword search over the entry, best matches first. Requires
+        a BM25 index on the column (declare with @materialize(index=BM25(...));
+        a freshly missed entry may error until the index build finishes)."""
+        table_ref = f"default.{DATA_SCHEMA}.{DATA_TABLE}"
+        return self._store.query_table(
+            self.entry,
+            f"SELECT * FROM bm25_search({quote_literal(table_ref)}, "
+            f"{quote_literal(quote_ident(column))}, {quote_literal(query)}) "
+            f"ORDER BY score DESC LIMIT {int(limit)}",
+        )
+
+    def vector_search(self, query: str, *, column: str, limit: int = 10) -> pa.Table:
+        """Semantic search over the entry, nearest first. Requires a vector
+        index (declare with @materialize(index=Vector(...))). Pass the indexed
+        source column; the query text is embedded server-side."""
+        return self._store.query_table(
+            self.entry,
+            f"SELECT *, vector_distance({quote_ident(column)}, "
+            f"{quote_literal(query)}) AS distance "
+            f"FROM {DATA_TABLE} ORDER BY distance LIMIT {int(limit)}",
+        )
+
     def __len__(self) -> int:
         return self.arrow().num_rows
 
@@ -131,6 +156,7 @@ def materialize(
     version: int = 0,
     background: Optional[bool] = None,
     key_fn: Optional[Callable[..., Any]] = None,
+    index: Union[BM25, Vector, Sequence[Union[BM25, Vector]], None] = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., MaterializedFrame]]:
     """Materialize a function's result into Hotdata.
 
@@ -140,8 +166,26 @@ def materialize(
 
     The call returns a MaterializedFrame either way; `.cached` says which path
     served it. `version=` busts the cache on code changes; `key_fn=` maps
-    non-JSON-serializable arguments to a stable identity.
+    non-JSON-serializable arguments to a stable identity. `index=` declares
+    BM25/Vector search indexes built when the entry persists.
     """
+    declarations: Tuple[Union[BM25, Vector], ...]
+    if index is None:
+        declarations = ()
+    elif isinstance(index, (BM25, Vector)):
+        declarations = (index,)
+    else:
+        declarations = tuple(index)
+    embedded = any(
+        isinstance(d, Vector) and d.provider is not None for d in declarations
+    )
+    if embedded and len(declarations) > 1:
+        # platform constraint: embedding-backed vector indexes cannot coexist
+        # with other indexes on the same table
+        raise ValueError(
+            "an embedding-backed Vector index (provider=...) cannot be "
+            "combined with other indexes on the same entry"
+        )
 
     def decorate(func: Callable[..., Any]) -> Callable[..., MaterializedFrame]:
         @functools.wraps(func)
@@ -177,6 +221,7 @@ def materialize(
                     ttl=ttl,
                     version=version,
                     background=background,
+                    indexes=declarations,
                 )
             except MaterializedError:
                 logger.warning(

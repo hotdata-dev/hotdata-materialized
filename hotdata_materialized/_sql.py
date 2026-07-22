@@ -1,15 +1,25 @@
-"""SQL literal encoding for registry statements.
+"""SQL literal and identifier encoding.
 
 POST /v1/queries takes SQL text only — there are no bind parameters — so
-every value written into registry SQL must go through quote_literal().
+every value written into SQL must go through quote_literal(), and every
+caller-supplied identifier (column names in search) through quote_ident().
 """
 
 from __future__ import annotations
 
 import datetime as _dt
 import math
+import re
 
 from .exceptions import RegistryError
+
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def quote_ident(name: str) -> str:
+    if not _IDENT.match(name):
+        raise ValueError(f"invalid SQL identifier: {name!r}")
+    return name
 
 
 def quote_literal(value) -> str:
