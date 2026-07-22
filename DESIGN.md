@@ -2,7 +2,7 @@
 
 **Package:** `hotdata-materialized` (module `hotdata_materialized`)
 **Primitive:** `@materialize` decorator → `MaterializedFrame` handle
-**Status:** Draft v0.2 (2026-07-22)
+**Status:** v0.2 — see the README roadmap for what is implemented
 
 ## What it is
 
@@ -209,7 +209,7 @@ write-through for callers that need `.sql()` on the entry immediately.
 
 ## MaterializedFrame
 
-First cut implements `.arrow()`, `.df()`, `.to_pylist()`, `len()`, and
+Implemented today: `.arrow()`, `.df()`, `.to_pylist()`, `len()`, and
 `.sql()` (server-side; requires a persisted entry — on a fresh
 write-behind miss it raises until the background persist lands). The
 rest of this section is the target design.
@@ -242,7 +242,7 @@ frame.meta                       # fingerprint, database_id, created_at, expires
 
 ## Decorator API
 
-Implemented (first cut):
+Implemented:
 
 ```python
 from hotdata_materialized import materialize
@@ -353,7 +353,7 @@ synchronous — fine for WSGI; async views get `sync_to_async` wrappers
    load → registry upsert; delete path). Pure SDK composition.
 2. **`@materialize` + `MaterializedFrame`** with the three backings,
    `.df()/.arrow()/.pl()/.sql()`, inline-payload short-circuit, fail-open.
-   *(shipped: first cut — arrow/df/to_pylist/sql, fail-open)*
+   *(shipped: arrow/df/to_pylist/sql, fail-open)*
 3. **Chainable facade:** immutable lazy queryset compiler over the entry
    table (Django lookup syntax).
 4. **Freshness machinery:** SWR, building-row lock, sweep management command +
