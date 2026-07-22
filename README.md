@@ -44,95 +44,70 @@ HOTDATA_MATERIALIZED = {
 
 ## Using it in a Django view
 
-The `@materialize` decorator is coming (see [DESIGN.md](DESIGN.md)); today the
-primitives compose in a few lines. The pattern: fingerprint the queryset,
-check the registry, read the entry on a hit, run-and-materialize on a miss.
+Wrap the expensive part in `@materialize`; call it from your view:
 
 ```python
-# views.py
-import pyarrow as pa
+# reports.py
 from django.db.models import Count, Sum
-from django.http import JsonResponse
-
-from hotdata_materialized import Config, EntryStore, Registry, get_clients
-from hotdata_materialized.fingerprint import fingerprint_queryset
-from hotdata_materialized.registry import utcnow_iso
+from hotdata_materialized import materialize
 
 from .models import Order
 
 
-def _cache():
-    config = Config.from_django()
-    clients = get_clients(config)
-    registry = Registry(clients, config)
-    return registry, EntryStore(clients, config, registry)
-
-
-def revenue_by_region(request):
-    queryset = (
+@materialize(ttl=3600)
+def revenue_by_region():
+    return (
         Order.objects
         .filter(status="complete")
         .values("region")
         .annotate(orders=Count("id"), revenue=Sum("total"))
         .order_by("-revenue")
     )
-
-    registry, store = _cache()
-    fingerprint = fingerprint_queryset(queryset)
-
-    entry = registry.lookup(fingerprint)
-    if entry and entry.status == "ready" and not entry.is_expired(utcnow_iso()):
-        # HIT: your database is never touched. Small results decode locally
-        # from the registry row; large ones stream back as Arrow.
-        table = store.read_table(entry)
-        return JsonResponse({"rows": table.to_pylist(), "cached": True})
-
-    # MISS: the query runs on your database, exactly as it would uncached.
-    rows = list(queryset)
-    store.materialize(
-        fingerprint,
-        pa.Table.from_pylist(rows),
-        key="revenue-by-region",   # human-readable label in the registry
-        ttl=3600,                  # None = never expires
-    )
-    # materialize() returned immediately — the parquet upload and registry
-    # write are happening in a background thread while you respond.
-    return JsonResponse({"rows": rows, "cached": False})
 ```
 
-Notes on the moving parts:
-
-- **`fingerprint_queryset(qs)`** hashes the compiled `(sql, params)` — no
-  cache keys to invent, and two different querysets can't collide. For
-  caching a plain function's result use `fingerprint_call(func, args, kwargs,
-  version=...)`; bump `version=` to bust the cache on a code change.
-- **`materialize()` is write-behind by default**: it returns a pending entry
-  immediately and persists in the background. Pass `background=False` to
-  block until the entry is ready (e.g. in a management command), and use
-  `store.flush()` in tests or scripts to wait for in-flight persists — it
-  returns any exceptions they raised.
-- **Dataframes:** `store.read_table(entry)` returns a `pyarrow.Table`;
-  `.to_pandas()` / `polars.from_arrow(...)` from there.
-
-## Working with a cached entry beyond fetching it
-
-Every entry is its own Hotdata database with the data at `main.data`, so you
-can push transformations to Hotdata instead of pulling rows back:
-
 ```python
-from hotdata.models.query_request import QueryRequest
+# views.py
+from django.http import JsonResponse
+from .reports import revenue_by_region
 
-clients = get_clients(Config.from_django())
-top5 = clients.query.query(
-    QueryRequest(sql="SELECT region, revenue FROM data ORDER BY revenue DESC LIMIT 5"),
-    x_database_id=entry.database_id,
-)
+
+def revenue_view(request):
+    frame = revenue_by_region()
+    return JsonResponse({"rows": frame.to_pylist(), "cached": frame.cached})
 ```
 
-Refresh or drop an entry explicitly:
+On a **hit** the function never runs and your database is never touched. On a
+**miss** the function runs exactly as it would uncached, the caller gets the
+result immediately, and the persist happens in a background thread. Either
+way you get a `MaterializedFrame`:
+
+- `frame.arrow()` — the data as a `pyarrow.Table` (`frame.df()` for pandas,
+  `frame.to_pylist()` for dicts, `len(frame)` for the row count)
+- `frame.sql("SELECT region, revenue FROM this ORDER BY revenue DESC LIMIT 5")`
+  — SQL runs server-side against the cached entry; `this` names the data
+- `frame.cached` — which path served it; `frame.entry` — the registry record
+
+The wrapped function can return an iterable of dicts (a `.values()` queryset),
+a `pyarrow.Table`, or a pandas DataFrame. Decorator knobs: `ttl=` (seconds,
+`None` = never expires), `version=` (bump to bust the cache on code changes),
+`key=` (human-readable label), `key_fn=` (stable identity for arguments that
+aren't JSON-serializable), `background=False` (block until persisted).
+Fail-open by design: if Hotdata is unreachable, the function runs and its
+result is served uncached — the cache degrades to "no cache," never to
+"no page."
+
+## Evicting entries
+
+The decorator composes public primitives (`fingerprint_call` /
+`fingerprint_queryset`, `Registry`, `EntryStore`) that you can use directly —
+for example to drop an entry explicitly:
 
 ```python
-store.evict(fingerprint)   # delete the registry row and the entry database
+from hotdata_materialized import fingerprint_call
+from hotdata_materialized.decorator import get_runtime
+
+registry, store = get_runtime()
+store.evict(fingerprint_call(revenue_by_region))
 ```
 
 Expired entries stop being served immediately (the `is_expired` check) and
@@ -154,10 +129,11 @@ trade-offs.
 
 ## Status / roadmap
 
-First draft. Implemented: fingerprinting, the remote registry, entry store
-with write-behind persists, Arrow-native reads, and the TPC-H demo. Next: the
-`@materialize` decorator and `MaterializedFrame` handle, stale-while-
-revalidate refresh, the sweep command, and vector/BM25 index declarations.
+First draft. Implemented: the `@materialize` decorator and
+`MaterializedFrame` (first cut), fingerprinting, the remote registry, entry
+store with write-behind persists, Arrow-native reads, and the TPC-H demo.
+Next: stale-while-revalidate refresh, the sweep command, a chainable queryset
+facade on the frame, and vector/BM25 index declarations.
 
 ## Demo
 
