@@ -127,6 +127,16 @@ def test_sql_runs_server_side_against_the_entry(runtime):
     assert top.to_pylist() == [{"channel": "organic"}]
 
 
+def test_sql_leaves_string_literals_alone(runtime):
+    calls = {"n": 0}
+    report = make_report(calls)
+    report("this")  # the day column literally contains "this"
+    runtime.store.flush()
+    frame = report("this")
+    rows = frame.sql("SELECT n FROM this WHERE day = 'this' AND n > 8")
+    assert rows.to_pylist() == [{"n": 10}]
+
+
 def test_to_arrow_accepts_table_and_rows():
     table = pa.table({"n": [1, 2]})
     assert to_arrow(table) is table
