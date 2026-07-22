@@ -209,7 +209,8 @@ write-through for callers that need `.sql()` on the entry immediately.
 
 ## MaterializedFrame
 
-Implemented today: `.arrow()`, `.df()`, `.to_pylist()`, `len()`, and
+Implemented today: `.arrow()`, `.df()`, `.to_pylist()`, `len()`,
+`.search()`, `.vector_search()`, and
 `.sql()` (server-side; requires a persisted entry — on a fresh
 write-behind miss it raises until the background persist lands). The
 rest of this section is the target design.
@@ -253,6 +254,7 @@ from hotdata_materialized import materialize
     version=2,                    # bump to bust on code changes
     background=True,              # write-behind (default) | write-through
     key_fn=None,                  # stable identity for opaque arguments
+    index=BM25("notes"),          # or Vector(...); built at persist time
 )
 def daily_signups(start, end):
     return (Event.objects
@@ -261,11 +263,11 @@ def daily_signups(start, end):
             .annotate(n=Count("id")))
 ```
 
-Planned knobs (steps 4–5, do not document user-facing until they exist):
+Planned knobs (step 4, do not document user-facing until they exist):
 `mode="swr" | "strict"` (refresh behavior), `invalidate_on=[Model]`
-(signal-based staleness), `index=Vector(...)/BM25(...)` (search indexes),
-`on_error="fallback" | "raise"` (fail-open is currently always on), and a
-`from_queryset(qs, ttl=)` imperative helper for one-off QuerySets.
+(signal-based staleness), `on_error="fallback" | "raise"` (fail-open is
+currently always on), and a `from_queryset(qs, ttl=)` imperative helper
+for one-off QuerySets.
 
 ## Fingerprinting
 

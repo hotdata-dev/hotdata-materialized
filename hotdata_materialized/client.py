@@ -29,6 +29,7 @@ class HotdataClients:
         self.databases = hotdata.DatabasesApi(self.api_client)
         self.uploads = UploadsApi(self.api_client)
         self.results = ResultsApi(self.api_client)
+        self.indexes = hotdata.IndexesApi(self.api_client)
 
 
 _lock = threading.Lock()

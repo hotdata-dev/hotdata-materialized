@@ -98,6 +98,42 @@ Fail-open by design: if Hotdata is unreachable, the function runs and its
 result is served uncached — the cache degrades to "no cache," never to
 "no page."
 
+## Search
+
+Declare a search index on the decorator and the entry gets it when it
+persists (builds run server-side; a freshly missed entry may error on search
+for a few seconds until its index is ready):
+
+```python
+from hotdata_materialized import BM25, Vector, materialize
+
+
+@materialize(ttl=3600, index=BM25("notes"))
+def incidents():
+    return Incident.objects.values("id", "notes", "severity")
+
+
+incidents().search("checkout errors outage", column="notes", limit=5)
+```
+
+Vector (semantic) search embeds your text server-side via a workspace
+embedding provider — pass the indexed source column and a natural-language
+query:
+
+```python
+@materialize(ttl=3600, index=Vector("notes", provider="emb_...", metric="cosine"))
+def incidents_semantic():
+    return Incident.objects.values("id", "notes")
+
+
+incidents_semantic().vector_search("the site was down", column="notes", limit=5)
+```
+
+Both return the matching rows as a `pyarrow.Table` with a relevance column
+(`score` / `distance`). One platform rule to know: an embedding-backed vector
+index cannot share an entry with other indexes — the decorator rejects that
+combination up front.
+
 ## Evicting entries
 
 The decorator composes public primitives (`fingerprint_call` /
@@ -142,7 +178,8 @@ trade-offs.
 - [ ] Stale-while-revalidate refresh (rebuild protocol)
 - [ ] Sweep command for expired entries
 - [ ] Chainable queryset facade on the frame (`.filter()/.order_by()`)
-- [ ] Vector/BM25 index declarations and `frame.search()`
+- [x] Vector/BM25 index declarations, `frame.search()` and
+      `frame.vector_search()`
 - [ ] Async view support (`await frame.aarrow()`)
 - [ ] PyPI release
 

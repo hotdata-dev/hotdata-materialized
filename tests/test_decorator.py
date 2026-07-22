@@ -146,3 +146,104 @@ def test_to_arrow_accepts_table_and_rows():
 def test_to_arrow_rejects_non_dict_rows():
     with pytest.raises(TypeError, match="iterable of dicts"):
         to_arrow([1, 2, 3])
+
+
+def test_index_declarations_create_indexes_at_persist(runtime):
+    from hotdata_materialized import BM25, Vector
+
+    @materialize(ttl=60, index=BM25("notes"))
+    def notes():
+        return [{"notes": "server outage in eu-west", "n": 1}]
+
+    @materialize(ttl=60, index=Vector("notes", provider="emb_1", metric="cosine"))
+    def embedded_notes():
+        return [{"notes": "payment gateway timeout", "n": 2}]
+
+    notes()
+    embedded_notes()
+    runtime.store.flush()
+    assert len(runtime.backend.index_creates) == 2
+    # two background persists race; order by type before asserting
+    (conn_id, schema, table, bm25_req), (_, _, _, vec_req) = sorted(
+        runtime.backend.index_creates, key=lambda c: c[3].index_type
+    )
+    assert conn_id.startswith("conn_db_")
+    assert (schema, table) == ("main", "data")
+    assert bm25_req.index_type == "bm25"
+    assert bm25_req.columns == ["notes"]
+    assert bm25_req.var_async is True
+    assert vec_req.index_type == "vector"
+    assert vec_req.metric == "cosine"
+    assert vec_req.embedding_provider_id == "emb_1"
+
+
+def test_no_index_declared_creates_none(runtime):
+    calls = {"n": 0}
+    report = make_report(calls)
+    report("2026-07-22")
+    runtime.store.flush()
+    assert runtime.backend.index_creates == []
+
+
+def test_search_builds_bm25_sql(runtime, monkeypatch):
+    calls = {"n": 0}
+    report = make_report(calls)
+    report("2026-07-22")
+    runtime.store.flush()
+    frame = report("2026-07-22")
+    captured: dict[str, str] = {}
+    monkeypatch.setattr(
+        runtime.store, "query_table", lambda entry, sql: captured.update(sql=sql)
+    )
+    frame.search("outage in eu-west", column="day", limit=5)
+    assert captured["sql"] == (
+        "SELECT * FROM bm25_search('default.main.data', 'day', "
+        "'outage in eu-west') ORDER BY score DESC LIMIT 5"
+    )
+
+
+def test_vector_search_builds_sql_and_validates_column(runtime, monkeypatch):
+    calls = {"n": 0}
+    report = make_report(calls)
+    report("2026-07-22")
+    runtime.store.flush()
+    frame = report("2026-07-22")
+    captured: dict[str, str] = {}
+    monkeypatch.setattr(
+        runtime.store, "query_table", lambda entry, sql: captured.update(sql=sql)
+    )
+    frame.vector_search("churn risk", column="notes", limit=3)
+    assert captured["sql"] == (
+        "SELECT *, vector_distance(notes, 'churn risk') AS distance "
+        "FROM data ORDER BY distance LIMIT 3"
+    )
+    with pytest.raises(ValueError, match="identifier"):
+        frame.vector_search("x", column="notes; DROP TABLE data")
+
+
+def test_embedded_vector_cannot_combine_with_other_indexes():
+    from hotdata_materialized import BM25, Vector
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        materialize(index=[BM25("notes"), Vector("notes", provider="emb_1")])
+
+
+def test_index_failure_does_not_discard_the_cached_entry(runtime, monkeypatch):
+    from hotdata_materialized import BM25
+    from hotdata_materialized.registry import STATUS_READY
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("bad embedding provider")
+
+    monkeypatch.setattr(runtime.backend.indexes, "create_index", broken)
+
+    @materialize(ttl=60, index=BM25("notes"))
+    def notes():
+        return [{"notes": "outage", "n": 1}]
+
+    notes()
+    errors = runtime.store.flush()
+    assert len(errors) == 1 and "entry cached" in str(errors[0])
+    frame = notes()  # next call is a hit despite the failed index
+    assert frame.cached is True
+    assert frame.entry.status == STATUS_READY

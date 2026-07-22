@@ -49,6 +49,8 @@ class FakeBackend:
             load_database_table=self._single_load,
         )
         self.uploads = SimpleNamespace(upload_file=self._upload_file)
+        self.index_creates = []  # (connection_id, schema, table, request)
+        self.indexes = SimpleNamespace(create_index=self._create_index)
 
     # -- query ---------------------------------------------------------------
 
@@ -104,6 +106,7 @@ class FakeBackend:
                 name=request.name,
                 default_catalog="default",
                 default_schema="main",
+                default_connection_id=f"conn_{db_id}",
             )
 
     def _delete_database(self, database_id):
@@ -182,3 +185,8 @@ class FakeBackend:
             upload_id = f"up_{next(self._ids)}"
             self.upload_blobs[upload_id] = bytes(source)
             return SimpleNamespace(upload_id=upload_id, size_bytes=len(source))
+
+    def _create_index(self, connection_id, var_schema, table, request):
+        with self._api_lock:
+            self.index_creates.append((connection_id, var_schema, table, request))
+            return SimpleNamespace(index_name=request.index_name, status="building")

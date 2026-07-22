@@ -15,6 +15,7 @@ from .exceptions import (
     StoreError,
 )
 from .fingerprint import fingerprint_call, fingerprint_queryset
+from .indexes import BM25, Vector
 from .registry import Registry, RegistryEntry
 from .store import EntryStore
 
@@ -23,6 +24,8 @@ __version__ = "0.1.0"
 __all__ = [
     "materialize",
     "MaterializedFrame",
+    "BM25",
+    "Vector",
     "Config",
     "HotdataClients",
     "get_clients",

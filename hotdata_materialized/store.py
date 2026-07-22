@@ -21,15 +21,17 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait as futures_wait
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Sequence, Set, Union
 
 import pyarrow as pa
 from hotdata.arrow import ResultNotReadyError
-from hotdata.exceptions import ApiException
+from hotdata.exceptions import ApiException, ConflictException
 from hotdata.models.create_database_request import CreateDatabaseRequest
 from hotdata.models.database_default_schema_decl import DatabaseDefaultSchemaDecl
 from hotdata.models.database_default_table_decl import DatabaseDefaultTableDecl
+from hotdata.models.create_index_request import CreateIndexRequest
 from hotdata.models.load_managed_table_request import LoadManagedTableRequest
 from hotdata.models.query_request import QueryRequest
 
@@ -42,6 +44,7 @@ from ._arrow import (
 )
 from .conf import Config
 from .exceptions import StoreError
+from .indexes import BM25, Vector
 from .registry import STATUS_BUILDING, Registry, RegistryEntry, utcnow_iso
 
 __all__ = [
@@ -92,6 +95,7 @@ class EntryStore:
         ttl: Optional[int] = None,
         version: int = 0,
         background: Optional[bool] = None,
+        indexes: Optional[Sequence[Union[BM25, Vector]]] = None,
     ) -> RegistryEntry:
         """Persist a captured result as a materialized entry.
 
@@ -101,12 +105,14 @@ class EntryStore:
         if background is None:
             background = self._config.background
         if not background:
-            return self._persist(fingerprint, table, key=key, ttl=ttl, version=version)
+            return self._persist(
+                fingerprint, table, key=key, ttl=ttl, version=version, indexes=indexes
+            )
 
         executor = _get_executor(self._config.background_max_workers)
         with self._inflight_lock:
             future = executor.submit(
-                self._persist_background, fingerprint, table, key, ttl, version
+                self._persist_background, fingerprint, table, key, ttl, version, indexes
             )
             self._inflight.setdefault(fingerprint, set()).add(future)
 
@@ -137,9 +143,13 @@ class EntryStore:
         done, _ = futures_wait(pending, timeout=timeout)
         return [e for e in (f.exception() for f in done) if e is not None]
 
-    def _persist_background(self, fingerprint, table, key, ttl, version) -> None:
+    def _persist_background(
+        self, fingerprint, table, key, ttl, version, indexes
+    ) -> None:
         try:
-            self._persist(fingerprint, table, key=key, ttl=ttl, version=version)
+            self._persist(
+                fingerprint, table, key=key, ttl=ttl, version=version, indexes=indexes
+            )
         except Exception:
             # Loud by design: a quietly failing write-behind path means the
             # cache never fills and nobody notices.
@@ -157,9 +167,11 @@ class EntryStore:
         key: Optional[str] = None,
         ttl: Optional[int] = None,
         version: int = 0,
+        indexes: Optional[Sequence[Union[BM25, Vector]]] = None,
     ) -> RegistryEntry:
         parquet_bytes = table_to_parquet_bytes(table)
-        database_id = self._create_entry_database(fingerprint, ttl)
+        created = self._create_entry_database(fingerprint, ttl)
+        database_id = created.id
         try:
             upload = self._clients.uploads.upload_file(
                 parquet_bytes,
@@ -189,7 +201,7 @@ class EntryStore:
                     x_database_id=database_id,
                     auto_follow=False,
                 ).result_id
-            return self._registry.mark_ready(
+            entry = self._registry.mark_ready(
                 fingerprint,
                 database_id=database_id,
                 ttl=ttl,
@@ -206,6 +218,20 @@ class EntryStore:
             # database without a ready row must not outlive the attempt.
             self._cleanup_failed_build(fingerprint, database_id)
             raise StoreError(f"materializing entry failed: {exc}") from exc
+
+        # Index kickoff is deliberately OUTSIDE the publication failure
+        # domain: a bad provider id or a stuck table lock must not discard
+        # otherwise-valid cached data. The entry stays served; search errors
+        # at the search site until the index problem is fixed.
+        try:
+            for declaration in indexes or ():
+                self._create_index(created.default_connection_id, declaration)
+        except Exception as exc:
+            raise StoreError(
+                f"index creation for entry {fp.short(fingerprint)} failed "
+                f"(entry cached; search unavailable): {exc}"
+            ) from exc
+        return entry
 
     def read_table(self, entry: RegistryEntry) -> pa.Table:
         """Materialize an entry's data as a pyarrow.Table.
@@ -293,7 +319,7 @@ class EntryStore:
 
     # -- internals -----------------------------------------------------------
 
-    def _create_entry_database(self, fingerprint: str, ttl: Optional[int]) -> str:
+    def _create_entry_database(self, fingerprint: str, ttl: Optional[int]) -> Any:
         # Server-side expiry (ttl + grace) is a best-effort backstop behind
         # the sweep; label is display-only — identity is the id via registry.
         expires_at = None
@@ -317,7 +343,41 @@ class EntryStore:
             )
         except Exception as exc:
             raise StoreError(f"creating entry database failed: {exc}") from exc
-        return created.id
+        return created
+
+    def _create_index(self, connection_id: str, declaration: Union[BM25, Vector]) -> None:
+        # index builds run as async jobs server-side; the persist does not wait
+        # "async" is a reserved word, so the SDK model aliases it; build
+        # requests from the wire shape
+        if isinstance(declaration, BM25):
+            request = CreateIndexRequest.model_validate({
+                "index_name": f"{DATA_TABLE}_{declaration.column}_bm25",
+                "index_type": "bm25",
+                "columns": [declaration.column],
+                "async": True,
+            })
+        else:
+            request = CreateIndexRequest.model_validate({
+                "index_name": f"{DATA_TABLE}_{declaration.column}_vector",
+                "index_type": "vector",
+                "columns": [declaration.column],
+                "metric": declaration.metric,
+                "embedding_provider_id": declaration.provider,
+                "dimensions": declaration.dimensions,
+                "async": True,
+            })
+        # the data load can still hold the table lock when this runs
+        # (observed: 409 RESOURCE_LOCKED with Retry-After); wait it out
+        for attempt in range(6):
+            try:
+                self._clients.indexes.create_index(
+                    connection_id, DATA_SCHEMA, DATA_TABLE, request
+                )
+                return
+            except ConflictException:
+                if attempt == 5:
+                    raise
+                time.sleep(5)
 
     def _delete_database(self, database_id: str) -> None:
         try:
