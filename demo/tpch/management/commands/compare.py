@@ -1,24 +1,22 @@
-"""Compare running a heavy TPC-H aggregation directly on Neon vs through
-hotdata-materialized: one miss (runs on Neon, captured into Hotdata), then
-hits that never touch Neon, plus a server-side transform on the cached entry.
+"""Compare running a heavy TPC-H aggregation directly on Postgres vs through
+the @materialize decorator: one miss (runs on Postgres, persisted
+write-behind), then hits that never touch Postgres, plus server-side SQL on
+the cached entry.
 
 Usage:
     python manage.py compare                 # Q1 pricing summary (tiny result)
-    python manage.py compare --scenario parts  # revenue by part (~200k rows)
+    python manage.py compare --scenario parts  # revenue by part (large result)
 """
 
 import datetime
 import statistics
 import time
-from decimal import Decimal
 
-import pyarrow as pa
 from django.core.management.base import BaseCommand, CommandError
 from django.db.models import Count, DecimalField, ExpressionWrapper, F, Sum, Value
-from hotdata.models.query_request import QueryRequest
 
-from hotdata_materialized import Config, EntryStore, Registry, get_clients
-from hotdata_materialized.fingerprint import fingerprint_queryset
+from hotdata_materialized import fingerprint_call, materialize
+from hotdata_materialized.decorator import get_runtime
 from tpch.models import LineItem
 
 DEC = DecimalField(max_digits=25, decimal_places=4)
@@ -51,7 +49,7 @@ def q1_queryset():
 
 
 def parts_queryset():
-    """Revenue by part: a wide group-by producing a large (~200k row) result."""
+    """Revenue by part: a wide group-by producing a large result."""
     return (
         LineItem.objects.values("partkey")
         .annotate(revenue=Sum(DISC_PRICE), orders=Count("orderkey"))
@@ -59,23 +57,29 @@ def parts_queryset():
     )
 
 
+@materialize(ttl=3600, key="tpch-q1")
+def q1_report():
+    return q1_queryset()
+
+
+@materialize(ttl=3600, key="tpch-parts")
+def parts_report():
+    return parts_queryset()
+
+
 SCENARIOS = {
     "q1": (
         q1_queryset,
-        "SELECT returnflag, linestatus, sum_disc_price FROM data "
+        q1_report,
+        "SELECT returnflag, linestatus, sum_disc_price FROM this "
         "ORDER BY sum_disc_price DESC LIMIT 3",
     ),
-    "parts": (parts_queryset, "SELECT partkey, revenue FROM data ORDER BY revenue DESC LIMIT 10"),
+    "parts": (
+        parts_queryset,
+        parts_report,
+        "SELECT partkey, revenue FROM this ORDER BY revenue DESC LIMIT 10",
+    ),
 }
-
-
-def rows_to_arrow(rows):
-    def clean(value):
-        return float(value) if isinstance(value, Decimal) else value
-
-    return pa.Table.from_pylist(
-        [{k: clean(v) for k, v in row.items()} for row in rows]
-    )
 
 
 def ms(seconds):
@@ -83,7 +87,7 @@ def ms(seconds):
 
 
 class Command(BaseCommand):
-    help = "Compare a heavy TPC-H query on Neon vs the hotdata-materialized path"
+    help = "Compare a heavy TPC-H query on Postgres vs the @materialize path"
 
     def add_arguments(self, parser):
         parser.add_argument("--scenario", choices=SCENARIOS, default="q1")
@@ -94,41 +98,36 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, scenario, runs, keep, **options):
-        queryset_factory, transform_sql = SCENARIOS[scenario]
-        config = Config.from_django()
-        clients = get_clients(config)
-        registry = Registry(clients, config)
-        store = EntryStore(clients, config, registry)
-
-        fingerprint = fingerprint_queryset(queryset_factory())
+        queryset_factory, report, transform_sql = SCENARIOS[scenario]
+        _, store = get_runtime()
+        # the decorator fingerprints the wrapped function + its (empty) args
+        fingerprint = fingerprint_call(report.__wrapped__)
         self.stdout.write(f"scenario={scenario}  fingerprint={fingerprint[:16]}…\n")
 
-        # -- direct: Neon does the work every time --------------------------
+        # -- direct: Postgres does the work every time -----------------------
         direct_times = []
         for run in range(runs):
             start = time.perf_counter()
             rows = list(queryset_factory())
             direct_times.append(time.perf_counter() - start)
             self.stdout.write(
-                f"  neon direct run {run + 1}: {ms(direct_times[-1])} ({len(rows):,} rows)"
+                f"  postgres direct run {run + 1}: {ms(direct_times[-1])} "
+                f"({len(rows):,} rows)"
             )
 
-        # -- miss: caller gets rows at Neon speed; persist runs write-behind --
+        # -- miss: caller gets the frame at Postgres speed; persist is hidden --
         if not keep:
             store.evict(fingerprint)
-        entry = registry.lookup(fingerprint)
         miss_time = None
         background_time = None
-        if entry is None or entry.status != "ready":
-            start = time.perf_counter()
-            rows = list(queryset_factory())
-            entry = store.materialize(
-                fingerprint, rows_to_arrow(rows), key=scenario, ttl=3600
-            )
-            miss_time = time.perf_counter() - start
+        start = time.perf_counter()
+        frame = report()
+        elapsed = time.perf_counter() - start
+        if not frame.cached:
+            miss_time = elapsed
             self.stdout.write(
                 f"  materialized miss, perceived: {ms(miss_time)} "
-                f"({len(rows):,} rows returned to caller)"
+                f"({len(frame):,} rows returned to caller)"
             )
             start = time.perf_counter()
             errors = store.flush()
@@ -140,36 +139,37 @@ class Command(BaseCommand):
                 f"return (off the request path)"
             )
 
-        # -- hits: Neon is never touched, data comes back as Arrow ----------
+        # -- hits: Postgres is never touched, data comes back as Arrow -------
         hit_times = []
         for _ in range(5):
             start = time.perf_counter()
-            entry = registry.lookup(fingerprint)
-            result = store.read_table(entry)
+            frame = report()
+            table = frame.arrow()
             hit_times.append(time.perf_counter() - start)
+        if not frame.cached:
+            raise CommandError("expected a hit; entry never became ready")
         backing = (
-            "inline payload" if entry.inline_payload else "entry database (arrow)"
+            "inline payload" if frame.entry.inline_payload
+            else "entry database (arrow)"
         )
         self.stdout.write(
             f"  materialized hit ×5 via {backing}: median "
-            f"{ms(statistics.median(hit_times))} ({result.num_rows:,} rows)"
+            f"{ms(statistics.median(hit_times))} ({table.num_rows:,} rows)"
         )
 
         # -- transform: SQL over the cached entry, server-side ---------------
         start = time.perf_counter()
-        response = clients.query.query(
-            QueryRequest(sql=transform_sql), x_database_id=entry.database_id
-        )
+        top = frame.sql(transform_sql)
         transform_time = time.perf_counter() - start
         self.stdout.write(f"  server-side SQL on cached entry: {ms(transform_time)}")
-        for row in response.rows:
+        for row in top.to_pylist():
             self.stdout.write(f"    {row}")
 
         # -- summary ----------------------------------------------------------
         median_direct = statistics.median(direct_times)
         median_hit = statistics.median(hit_times)
         self.stdout.write("")
-        self.stdout.write(f"  {'neon direct (median)':34s} {ms(median_direct)}")
+        self.stdout.write(f"  {'postgres direct (median)':34s} {ms(median_direct)}")
         if miss_time is not None:
             self.stdout.write(
                 f"  {'materialized miss, perceived':34s} {ms(miss_time)}"
@@ -180,5 +180,5 @@ class Command(BaseCommand):
             )
         self.stdout.write(
             f"  {'materialized hit (median)':34s} {ms(median_hit)}"
-            f"  ({median_direct / median_hit:,.1f}× faster, zero load on Neon)"
+            f"  ({median_direct / median_hit:,.1f}× faster, zero load on Postgres)"
         )

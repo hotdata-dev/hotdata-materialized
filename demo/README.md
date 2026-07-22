@@ -1,6 +1,7 @@
 # Demo: TPC-H on Neon vs hotdata-materialized
 
-Times a heavy TPC-H aggregation three ways:
+Times a heavy TPC-H aggregation three ways, end to end through the
+`@materialize` decorator:
 
 1. **Neon direct** — the query runs on your Postgres every time.
 2. **Materialized miss** — the query runs on Neon once, and the result is

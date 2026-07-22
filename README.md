@@ -84,7 +84,9 @@ way you get a `MaterializedFrame`:
 - `frame.arrow()` — the data as a `pyarrow.Table` (`frame.df()` for pandas,
   `frame.to_pylist()` for dicts, `len(frame)` for the row count)
 - `frame.sql("SELECT region, revenue FROM this ORDER BY revenue DESC LIMIT 5")`
-  — SQL runs server-side against the cached entry; `this` names the data
+  — SQL runs server-side against the cached entry; `this` names the data.
+  Needs a persisted entry: available on hits (on a fresh miss the
+  write-behind persist has to land first; `background=False` avoids that)
 - `frame.cached` — which path served it; `frame.entry` — the registry record
 
 The wrapped function can return an iterable of dicts (a `.values()` queryset),
