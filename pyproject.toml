@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hotdata-materialized"
+version = "0.1.0"
+description = "Materialize expensive Django query results into Hotdata: miss runs locally, hit returns a queryable frame."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Hotdata" }]
+keywords = ["django", "hotdata", "cache", "materialized", "analytics", "parquet"]
+classifiers = [
+    "Framework :: Django",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "Django>=3.2",
+    "hotdata[arrow]>=0.8",
+    "pyarrow>=14.0.1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0", "duckdb>=1.0", "flake8>=4.0", "mypy>=1.5", "build>=1.0"]
+demo = ["psycopg[binary]>=3.1"]
+
+[project.urls]
+Homepage = "https://hotdata.dev"
+
+[tool.setuptools.packages.find]
+include = ["hotdata_materialized*"]
+
+[tool.setuptools.package-data]
+hotdata_materialized = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+files = ["hotdata_materialized", "tests"]
+# Same strictness ladder as sdk-python (strict = true is the eventual goal)
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+strict_equality = true
+extra_checks = true
+check_untyped_defs = true
+disallow_subclassing_any = true
+disallow_untyped_decorators = true
+disallow_any_generics = true
+
+[[tool.mypy.overrides]]
+module = ["django.*", "duckdb.*", "pyarrow.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["tests.models"]
+disallow_subclassing_any = false
