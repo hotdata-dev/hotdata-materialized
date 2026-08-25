@@ -1,4 +1,4 @@
-"""The remote registry: one managed database holding one row per entry.
+"""The remote registry: one instant database holding one row per entry.
 
 The hit/miss check is a SELECT against this database — the host application
 keeps no local state. POST /v1/queries is read-only (DML and DDL are
