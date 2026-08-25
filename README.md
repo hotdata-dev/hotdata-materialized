@@ -9,8 +9,8 @@ SQL server-side.
 
 Think materialized views, not Redis: entries are snapshots of expensive
 analytical results, with a TTL lifecycle, each living in its own Hotdata
-managed database. The host application needs **no migrations and no Redis** —
-entry metadata lives in a small Hotdata managed database (the registry),
+instant database. The host application needs **no migrations and no Redis** —
+entry metadata lives in a small Hotdata instant database (the registry),
 created on first use.
 
 Measured against TPC-H on a Neon Postgres (see [demo/](demo/)):
@@ -154,10 +154,10 @@ deletes them proactively is on the roadmap below.
 
 ## How it works
 
-One managed database (the **registry**) holds one row per entry: fingerprint,
+One instant database (the **registry**) holds one row per entry: fingerprint,
 status, TTL, the entry's database id, and — for small results — the data
 itself as an inline Arrow payload, so a chart-sized hit is served in a single
-API round trip. Larger results live in a per-entry managed database and are
+API round trip. Larger results live in a per-entry instant database and are
 fetched as an Arrow IPC stream via a result id minted at persist time (no
 re-query on hits). Failures are loud and fail toward "no cache": a failed
 persist leaves no registry row, and the next request simply misses again.

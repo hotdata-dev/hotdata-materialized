@@ -11,7 +11,7 @@ HotData. Wrap an expensive function with `@materialize`: on a **miss**, the
 function runs in the host application's environment and the result is captured
 and loaded into HotData as parquet; on a **hit**, the host app's database is
 never touched — the caller gets a `MaterializedFrame` backed by a HotData
-managed database that supports dataframes, SQL, and vector/BM25 search.
+instant database that supports dataframes, SQL, and vector/BM25 search.
 
 This is not a fast key-value cache. It is a **capability cache**: a hit does
 not save microseconds, it saves the host database from running a
@@ -73,7 +73,7 @@ Registry schema (one table, `main.entries`, in the registry database):
 CREATE TABLE entries (
     fingerprint     TEXT PRIMARY KEY,   -- content-address of the entry
     key             TEXT,               -- human-readable label from the decorator
-    database_id     TEXT,               -- the entry's managed database (db_...)
+    database_id     TEXT,               -- the entry's instant database (db_...)
     status          TEXT,               -- building | ready | failed
     created_at      TIMESTAMP,
     expires_at      TIMESTAMP,
@@ -115,7 +115,7 @@ results without round-tripping data through the client.
 
 ### 3. Database-per-entry
 
-Every materialized entry is **its own managed database**, named
+Every materialized entry is **its own instant database**, named
 `mz_<fingerprint32>` (a display label — identity is the server-issued
 database id, mapped from the full fingerprint by the registry). The captured result lands in a fixed
 location inside it: `main.data`.
@@ -366,7 +366,7 @@ synchronous — fine for WSGI; async views get `sync_to_async` wrappers
 
 ## Open questions
 
-1. **Workspace limits on managed database count** — database-per-entry needs
+1. **Workspace limits on instant database count** — database-per-entry needs
    a sanity check against quotas and any per-database cost/overhead on the
    HotData side.
 2. **Registry write throughput** — every persist costs an upload session +

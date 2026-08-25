@@ -1,4 +1,4 @@
-"""The entry store: one managed database per materialized entry.
+"""The entry store: one instant database per materialized entry.
 
 Persist path: create database -> upload parquet (presigned, direct to object
 storage) -> load into main.data -> mark the registry row ready. Everything
